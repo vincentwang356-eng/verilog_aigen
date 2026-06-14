@@ -1,0 +1,5 @@
+*.vvp
+*.vcd
+*.fst
+*.log
+work/
