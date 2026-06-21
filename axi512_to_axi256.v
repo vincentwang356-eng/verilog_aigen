@@ -108,11 +108,12 @@ module axi512_to_axi256 #(
     reg [S_DATA_WIDTH-1:0]   w_data_hold;
     reg [S_DATA_WIDTH/8-1:0] w_strb_hold;
     reg                  w_last_hold;
-    reg [1:0]            w_state;
+    reg [2:0]            w_state;
     reg                  w_half;
-    reg                  w_aw_done;
-    reg                  w_w_done;
     reg                  w_have_active;
+    reg [8:0]            w_total_subbeats;
+    reg [8:0]            w_sent_subbeats;
+    reg                  w_group_done;
 
     reg [ID_WIDTH-1:0]   r_id;
     reg [ADDR_WIDTH-1:0] r_addr;
@@ -122,10 +123,12 @@ module axi512_to_axi256 #(
     reg [7:0]            r_beat;
     reg [1:0]            r_resp_acc;
     reg [S_DATA_WIDTH-1:0] r_data_acc;
-    reg [1:0]            r_state;
+    reg [2:0]            r_state;
     reg                  r_half;
     reg                  r_need_low;
     reg                  r_need_high;
+    reg [8:0]            r_total_subbeats;
+    reg [8:0]            r_recv_subbeats;
 
     integer i;
 
@@ -179,8 +182,25 @@ module axi512_to_axi256 #(
                 else
                     next_addr = base + offset;
             end else begin
-                next_addr = addr + step;
+                if ((addr % step) != 0)
+                    next_addr = ((addr / step) + 1'b1) * step;
+                else
+                    next_addr = addr + step;
             end
+        end
+    endfunction
+
+    function first_unaligned_incr;
+        input [ADDR_WIDTH-1:0] addr;
+        input [2:0]            size;
+        input [7:0]            len;
+        input [1:0]            burst;
+        input [7:0]            beat;
+        reg [ADDR_WIDTH-1:0] step;
+        begin
+            step = {{(ADDR_WIDTH-1){1'b0}}, 1'b1} << size;
+            first_unaligned_incr = (burst == BURST_INCR) && (len != 0) &&
+                                   (beat == 0) && ((addr % step) != 0);
         end
     endfunction
 
@@ -210,6 +230,80 @@ module axi512_to_axi256 #(
             lo = half ? M_BYTES : 0;
             hi = half ? (S_BYTES - 1) : (M_BYTES - 1);
             read_needs_half = (start_b <= hi) && (end_b >= lo);
+        end
+    endfunction
+
+    function beat_needs_half;
+        input [ADDR_WIDTH-1:0] addr;
+        input [2:0] size;
+        input [7:0] len;
+        input [1:0] burst;
+        input [7:0] beat;
+        input half;
+        integer start_b;
+        integer end_b;
+        integer lo;
+        integer hi;
+        reg [ADDR_WIDTH-1:0] step;
+        begin
+            step = {{(ADDR_WIDTH-1){1'b0}}, 1'b1} << size;
+            start_b = addr[5:0];
+            if (first_unaligned_incr(addr, size, len, burst, beat))
+                end_b = (((addr / step) + 1'b1) * step) - {addr[ADDR_WIDTH-1:6], 6'b000000} - 1;
+            else
+                end_b = start_b + (1 << size) - 1;
+            lo = half ? M_BYTES : 0;
+            hi = half ? (S_BYTES - 1) : (M_BYTES - 1);
+            beat_needs_half = (start_b <= hi) && (end_b >= lo);
+        end
+    endfunction
+
+    function [8:0] subbeat_count;
+        input [ADDR_WIDTH-1:0] addr;
+        input [2:0] size;
+        input [7:0] len;
+        input [1:0] burst;
+        reg [ADDR_WIDTH-1:0] a;
+        integer beat;
+        begin
+            a = addr;
+            subbeat_count = 0;
+            for (beat = 0; beat < 256; beat = beat + 1) begin
+                if (beat <= len) begin
+                    if (beat_needs_half(a, size, len, burst, beat[7:0], 1'b0))
+                        subbeat_count = subbeat_count + 1'b1;
+                    if (beat_needs_half(a, size, len, burst, beat[7:0], 1'b1))
+                        subbeat_count = subbeat_count + 1'b1;
+                    a = next_addr(a, size, len, burst);
+                end
+            end
+        end
+    endfunction
+
+    function [8:0] group_subbeat_count;
+        input [ADDR_WIDTH-1:0] addr;
+        input [2:0] size;
+        input [7:0] len;
+        input [1:0] burst;
+        input [7:0] beat_start;
+        reg [ADDR_WIDTH-1:0] a;
+        integer beat;
+        begin
+            a = addr;
+            group_subbeat_count = 0;
+            for (beat = 0; beat < 256; beat = beat + 1) begin
+                if ((beat_start + beat) <= len) begin
+                    if (beat_needs_half(a, size, len, burst, beat_start + beat, 1'b0))
+                        group_subbeat_count = group_subbeat_count + 1'b1;
+                    if (beat_needs_half(a, size, len, burst, beat_start + beat, 1'b1))
+                        group_subbeat_count = group_subbeat_count + 1'b1;
+                    if (first_unaligned_incr(a, size, len, burst, beat_start + beat)) begin
+                        beat = 256;
+                    end else begin
+                        a = next_addr(a, size, len, burst);
+                    end
+                end
+            end
         end
     endfunction
 
@@ -275,8 +369,29 @@ module axi512_to_axi256 #(
                         w_burst <= aw_burst_q[aw_rd_ptr];
                         w_beat <= 0;
                         w_resp_acc <= 2'b00;
+                        w_total_subbeats <= group_subbeat_count(aw_addr_q[aw_rd_ptr], aw_size_q[aw_rd_ptr], aw_len_q[aw_rd_ptr], aw_burst_q[aw_rd_ptr], 8'd0);
+                        w_sent_subbeats <= 0;
+                        w_group_done <= 1'b0;
                         aw_rd_ptr <= (aw_rd_ptr == OUTSTANDING-1) ? 0 : aw_rd_ptr + 1;
-                        w_state <= 2'd1;
+                        w_state <= 3'd4;
+                    end
+                end
+                3'd4: begin
+                    m_awid <= w_id;
+                    w_total_subbeats <= group_subbeat_count(w_addr, w_size, w_len, w_burst, w_beat);
+                    w_sent_subbeats <= 0;
+                    w_group_done <= 1'b0;
+                    if (beat_needs_half(w_addr, w_size, w_len, w_burst, w_beat, 1'b0))
+                        m_awaddr <= {w_addr[ADDR_WIDTH-1:6], 6'b000000};
+                    else
+                        m_awaddr <= {w_addr[ADDR_WIDTH-1:6], 6'b000000} + M_BYTES;
+                    m_awlen <= group_subbeat_count(w_addr, w_size, w_len, w_burst, w_beat) - 1'b1;
+                    m_awsize <= 3'd5;
+                    m_awburst <= w_burst;
+                    m_awvalid <= 1'b1;
+                    if (m_awvalid && m_awready) begin
+                        m_awvalid <= 1'b0;
+                        w_state <= 3'd1;
                     end
                 end
                 2'd1: begin
@@ -285,63 +400,75 @@ module axi512_to_axi256 #(
                         w_strb_hold <= s_wstrb;
                         w_last_hold <= s_wlast;
                         w_half <= 1'b0;
-                        w_have_active <= half_has_strobe(s_wstrb, 1'b0);
-                        w_aw_done <= 1'b0;
-                        w_w_done <= 1'b0;
-                        w_state <= 2'd2;
+                        w_have_active <= beat_needs_half(w_addr, w_size, w_len, w_burst, w_beat, 1'b0);
+                        w_state <= 3'd2;
                     end
                 end
                 2'd2: begin
                     if (!w_have_active) begin
                         if (w_half == 1'b0) begin
                             w_half <= 1'b1;
-                            w_have_active <= half_has_strobe(w_strb_hold, 1'b1);
-                            w_aw_done <= 1'b0;
-                            w_w_done <= 1'b0;
+                            w_have_active <= beat_needs_half(w_addr, w_size, w_len, w_burst, w_beat, 1'b1);
                         end else begin
                             if (w_beat == w_len || w_last_hold) begin
-                                s_bid <= w_id;
-                                s_bresp <= w_resp_acc;
-                                s_bvalid <= 1'b1;
-                                w_state <= 2'd0;
+                                w_group_done <= 1'b1;
+                                m_bready <= 1'b1;
+                                w_state <= 3'd3;
+                            end else if (w_sent_subbeats == w_total_subbeats) begin
+                                w_addr <= next_addr(w_addr, w_size, w_len, w_burst);
+                                w_beat <= w_beat + 1'b1;
+                                w_group_done <= 1'b0;
+                                m_bready <= 1'b1;
+                                w_state <= 3'd3;
                             end else begin
                                 w_addr <= next_addr(w_addr, w_size, w_len, w_burst);
                                 w_beat <= w_beat + 1'b1;
-                                w_state <= 2'd1;
+                                w_state <= 3'd1;
                             end
                         end
                     end else begin
-                        if (!w_aw_done) begin
-                            m_awid <= w_id;
-                            m_awaddr <= {w_addr[ADDR_WIDTH-1:6], 6'b000000} + (w_half ? M_BYTES : 0);
-                            m_awlen <= 8'd0;
-                            m_awsize <= 3'd5;
-                            m_awburst <= BURST_INCR;
-                            m_awvalid <= 1'b1;
-                            if (m_awvalid && m_awready) begin
-                                m_awvalid <= 1'b0;
-                                w_aw_done <= 1'b1;
-                            end
+                        if (w_half) begin
+                            m_wdata <= w_data_hold[511:256];
+                            m_wstrb <= w_strb_hold[63:32];
+                        end else begin
+                            m_wdata <= w_data_hold[255:0];
+                            m_wstrb <= w_strb_hold[31:0];
                         end
-                        if (!w_w_done) begin
-                            if (w_half) begin
-                                m_wdata <= w_data_hold[511:256];
-                                m_wstrb <= w_strb_hold[63:32];
+                        m_wlast <= (w_sent_subbeats == (w_total_subbeats - 1'b1));
+                        m_wvalid <= 1'b1;
+                        if (m_wvalid && m_wready) begin
+                            m_wvalid <= 1'b0;
+                            w_sent_subbeats <= w_sent_subbeats + 1'b1;
+                            if (w_sent_subbeats == (w_total_subbeats - 1'b1)) begin
+                                if (w_half == 1'b1 || !beat_needs_half(w_addr, w_size, w_len, w_burst, w_beat, 1'b1)) begin
+                                    if (w_beat == w_len || w_last_hold)
+                                        w_group_done <= 1'b1;
+                                    else begin
+                                        w_addr <= next_addr(w_addr, w_size, w_len, w_burst);
+                                        w_beat <= w_beat + 1'b1;
+                                        w_group_done <= 1'b0;
+                                    end
+                                    m_bready <= 1'b1;
+                                    w_state <= 3'd3;
+                                end else begin
+                                    w_half <= 1'b1;
+                                    w_have_active <= beat_needs_half(w_addr, w_size, w_len, w_burst, w_beat, 1'b1);
+                                end
+                            end else
+                            if (w_half == 1'b0) begin
+                                w_half <= 1'b1;
+                                w_have_active <= beat_needs_half(w_addr, w_size, w_len, w_burst, w_beat, 1'b1);
                             end else begin
-                                m_wdata <= w_data_hold[255:0];
-                                m_wstrb <= w_strb_hold[31:0];
+                                if (w_beat == w_len || w_last_hold) begin
+                                    w_group_done <= 1'b1;
+                                    m_bready <= 1'b1;
+                                    w_state <= 3'd3;
+                                end else begin
+                                    w_addr <= next_addr(w_addr, w_size, w_len, w_burst);
+                                    w_beat <= w_beat + 1'b1;
+                                    w_state <= 3'd1;
+                                end
                             end
-                            m_wlast <= 1'b1;
-                            m_wvalid <= 1'b1;
-                            if (m_wvalid && m_wready) begin
-                                m_wvalid <= 1'b0;
-                                w_w_done <= 1'b1;
-                            end
-                        end
-                        if ((w_aw_done || (m_awvalid && m_awready)) &&
-                            (w_w_done || (m_wvalid && m_wready))) begin
-                            m_bready <= 1'b1;
-                            w_state <= 2'd3;
                         end
                     end
                 end
@@ -349,23 +476,13 @@ module axi512_to_axi256 #(
                     if (m_bvalid && m_bready) begin
                         w_resp_acc <= worst_resp(w_resp_acc, m_bresp);
                         m_bready <= 1'b0;
-                        if (w_half == 1'b0) begin
-                            w_half <= 1'b1;
-                            w_have_active <= half_has_strobe(w_strb_hold, 1'b1);
-                            w_aw_done <= 1'b0;
-                            w_w_done <= 1'b0;
-                            w_state <= 2'd2;
+                        if (w_group_done) begin
+                            s_bid <= w_id;
+                            s_bresp <= worst_resp(w_resp_acc, m_bresp);
+                            s_bvalid <= 1'b1;
+                            w_state <= 3'd0;
                         end else begin
-                            if (w_beat == w_len || w_last_hold) begin
-                                s_bid <= w_id;
-                                s_bresp <= worst_resp(w_resp_acc, m_bresp);
-                                s_bvalid <= 1'b1;
-                                w_state <= 2'd0;
-                            end else begin
-                                w_addr <= next_addr(w_addr, w_size, w_len, w_burst);
-                                w_beat <= w_beat + 1'b1;
-                                w_state <= 2'd1;
-                            end
+                            w_state <= 3'd4;
                         end
                     end
                 end
@@ -382,19 +499,36 @@ module axi512_to_axi256 #(
                         r_size <= ar_size_q[ar_rd_ptr];
                         r_burst <= ar_burst_q[ar_rd_ptr];
                         r_beat <= 0;
+                        r_total_subbeats <= subbeat_count(ar_addr_q[ar_rd_ptr], ar_size_q[ar_rd_ptr], ar_len_q[ar_rd_ptr], ar_burst_q[ar_rd_ptr]);
+                        r_recv_subbeats <= 0;
                         ar_rd_ptr <= (ar_rd_ptr == OUTSTANDING-1) ? 0 : ar_rd_ptr + 1;
-                        r_state <= 2'd1;
+                        r_state <= 3'd1;
                     end
                 end
                 2'd1: begin
+                    m_arid <= r_id;
+                    if (read_needs_half(r_addr, r_size, 1'b0))
+                        m_araddr <= {r_addr[ADDR_WIDTH-1:6], 6'b000000};
+                    else
+                        m_araddr <= {r_addr[ADDR_WIDTH-1:6], 6'b000000} + M_BYTES;
+                    m_arlen <= r_total_subbeats[7:0] - 1'b1;
+                    m_arsize <= 3'd5;
+                    m_arburst <= r_burst;
+                    m_arvalid <= 1'b1;
+                    if (m_arvalid && m_arready) begin
+                        m_arvalid <= 1'b0;
+                        r_state <= 3'd2;
+                    end
+                end
+                3'd2: begin
                     r_data_acc <= {S_DATA_WIDTH{1'b0}};
                     r_resp_acc <= 2'b00;
                     r_need_low <= read_needs_half(r_addr, r_size, 1'b0);
                     r_need_high <= read_needs_half(r_addr, r_size, 1'b1);
                     r_half <= 1'b0;
-                    r_state <= 2'd2;
+                    r_state <= 3'd3;
                 end
-                2'd2: begin
+                3'd3: begin
                     if ((r_half == 1'b0 && !r_need_low) || (r_half == 1'b1 && !r_need_high)) begin
                         if (r_half == 1'b0) begin
                             r_half <= 1'b1;
@@ -404,38 +538,22 @@ module axi512_to_axi256 #(
                             s_rresp <= r_resp_acc;
                             s_rlast <= (r_beat == r_len);
                             s_rvalid <= 1'b1;
-                            r_state <= 2'd0;
-                            if (r_beat != r_len) begin
-                                r_addr <= next_addr(r_addr, r_size, r_len, r_burst);
-                                r_beat <= r_beat + 1'b1;
-                                r_state <= 2'd1;
-                            end
+                            r_state <= 3'd4;
                         end
                     end else begin
-                        m_arid <= r_id;
-                        m_araddr <= {r_addr[ADDR_WIDTH-1:6], 6'b000000} + (r_half ? M_BYTES : 0);
-                        m_arlen <= 8'd0;
-                        m_arsize <= 3'd5;
-                        m_arburst <= BURST_INCR;
-                        m_arvalid <= 1'b1;
-                        if (m_arvalid && m_arready) begin
-                            m_arvalid <= 1'b0;
-                            m_rready <= 1'b1;
-                            r_state <= 2'd3;
-                        end
+                        m_rready <= 1'b1;
                     end
-                end
-                2'd3: begin
                     if (m_rvalid && m_rready) begin
                         if (r_half)
                             r_data_acc[511:256] <= m_rdata;
                         else
                             r_data_acc[255:0] <= m_rdata;
                         r_resp_acc <= worst_resp(r_resp_acc, m_rresp);
+                        r_recv_subbeats <= r_recv_subbeats + 1'b1;
                         m_rready <= 1'b0;
                         if (r_half == 1'b0) begin
                             r_half <= 1'b1;
-                            r_state <= 2'd2;
+                            r_state <= 3'd3;
                         end else begin
                             s_rid <= r_id;
                             if (r_half)
@@ -445,13 +563,18 @@ module axi512_to_axi256 #(
                             s_rresp <= worst_resp(r_resp_acc, m_rresp);
                             s_rlast <= (r_beat == r_len);
                             s_rvalid <= 1'b1;
-                            if (r_beat == r_len) begin
-                                r_state <= 2'd0;
-                            end else begin
-                                r_addr <= next_addr(r_addr, r_size, r_len, r_burst);
-                                r_beat <= r_beat + 1'b1;
-                                r_state <= 2'd1;
-                            end
+                            r_state <= 3'd4;
+                        end
+                    end
+                end
+                3'd4: begin
+                    if (s_rvalid && s_rready) begin
+                        if (r_beat == r_len) begin
+                            r_state <= 3'd0;
+                        end else begin
+                            r_addr <= next_addr(r_addr, r_size, r_len, r_burst);
+                            r_beat <= r_beat + 1'b1;
+                            r_state <= 3'd2;
                         end
                     end
                 end

@@ -38,15 +38,18 @@ Write path:
 - Accepts up to `OUTSTANDING` AW commands.
 - Pairs W data with AW commands in AXI4 order.
 - Emits one single-beat 256-bit downstream write for each non-empty half.
-- Suppresses downstream writes for halves whose `WSTRB` is zero.
+- Emits one 256-bit downstream burst for each slave-side write burst when the
+  address sequence is representable with 256-bit beats.
+- Preserves byte enables by slicing the 512-bit `WSTRB` into the matching
+  256-bit output beat.
 - Aggregates downstream `BRESP` values and returns the worst response on the
   slave-side B channel with the original ID.
 
 Read path:
 
 - Accepts up to `OUTSTANDING` AR commands.
-- Emits one single-beat 256-bit downstream read for each half touched by the
-  requested transfer size and address.
+- Emits one 256-bit downstream read burst for each slave-side read burst when
+  the address sequence is representable with 256-bit beats.
 - Reassembles returned 256-bit data into the correct half of the 512-bit
   slave-side `RDATA`.
 - Aggregates downstream `RRESP` values and returns the worst response.
@@ -54,8 +57,14 @@ Read path:
 Burst handling:
 
 - `INCR`, `FIXED`, and `WRAP` address progression are implemented.
-- Downstream transactions are emitted as single 256-bit beats. This keeps the
-  converter simple while preserving the slave-visible burst behavior.
+- Downstream transactions are emitted as 256-bit bursts with `AxLEN` covering
+  the required lower/upper half-beats instead of issuing one command per half.
+- For unaligned multi-beat `INCR` bursts, the first transfer may be partial up
+  to the next `AxSIZE` boundary; later transfers advance from the aligned
+  boundary and use the full `AxSIZE` byte span.
+- If a slave-side write burst cannot be represented as one continuous 256-bit
+  output transaction, the bridge splits it into multiple output write
+  transactions and returns one aggregated slave-side `BRESP`.
 
 Ordering:
 
@@ -69,22 +78,44 @@ Ordering:
 - AXI user, region, lock, cache, protection, and QoS sideband signals are not
   included.
 - The design favors correctness and simple verification over maximum throughput.
-- The downstream side receives single-beat 256-bit accesses rather than merged
-  256-bit bursts.
+- Write data remains paired with accepted AW commands in order, matching AXI4's
+  lack of a WID signal.
 
 ## Verification
 
 The self-checking testbench covers:
 
-- Aligned full-width writes and reads.
-- Narrow aligned transfers.
-- Unaligned transfers crossing the 256-bit boundary.
-- Multi-beat `INCR` bursts.
-- `FIXED` and `WRAP` address progression.
-- Basic backpressure.
-- Multiple queued read and write commands.
-- Downstream error propagation.
-- Reset behavior.
+- W01 aligned full-width single write: one output `INCR` burst, `AWLEN=1`,
+  two 256-bit W beats, full strobes, correct `WLAST`.
+- W02 unaligned 32-byte single write crossing the 256-bit boundary: one output
+  `INCR` burst, `AWLEN=1`, strobes `FF00_0000` then `00FF_FFFF`.
+- W03 aligned two-beat 512-bit write burst: one output `INCR` burst,
+  `AWLEN=3`, four 256-bit W beats.
+- W04 narrow `FIXED` write burst: preserves `AWBURST=FIXED` and repeated
+  output address.
+- W05 legal `WRAP` write burst: preserves `AWBURST=WRAP` and verifies wrapped
+  256-bit output address sequence.
+- W06 write error propagation: downstream `SLVERR` is returned as slave-side
+  `BRESP`.
+- W07 unaligned multi-beat `INCR` write burst: first transfer is partial,
+  second transfer is aligned and full-size; output is split into two
+  transactions at `0x9000` and `0x9040`.
+- R01 aligned full-width single read: one output `INCR` burst, `ARLEN=1`, two
+  256-bit R beats reassembled into one 512-bit R beat.
+- R02 unaligned 32-byte single read crossing the 256-bit boundary: one output
+  `INCR` burst, `ARLEN=1`.
+- R03 unaligned multi-beat `INCR` read burst: first transfer is partial, second
+  transfer is aligned and full-size; output `ARLEN=3` covers the four 256-bit
+  read beats.
+- R04 narrow aligned read: one 256-bit output beat and correct slave-side
+  response.
+- R05 read error propagation: downstream `SLVERR` is returned as slave-side
+  `RRESP`.
+- R06 queued outstanding reads with slave-side backpressure: two AR commands are
+  accepted and completed in ID/order expected by the test.
+- T01 reset behavior: reset clears counters, valid flags, and model state
+  before the test starts and again at the end.
+- T02 waveform generation: `tb_axi512_to_axi256.vcd` is dumped for GTKWave.
 
 Run:
 
